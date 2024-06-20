@@ -1,12 +1,21 @@
 package textsplitter
 
 import (
+	"context"
 	"errors"
 	"log"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 
+	"golang.org/x/sync/errgroup"
+	
 	"github.com/tmc/langchaingo/schema"
 )
+
+// SPLIT_PARALLEL_THREAD can be set as an environment variable to control the number of goroutines to run to split text. Default is 50
+const SPLIT_PARALLEL_THREAD = "SPLIT_PARALLEL_THREAD"
 
 // ErrMismatchMetadatasAndText is returned when the number of texts and metadatas
 // given to CreateDocuments does not match. The function will not error if the
@@ -39,27 +48,45 @@ func CreateDocuments(textSplitter TextSplitter, texts []string, metadatas []map[
 
 	documents := make([]schema.Document, 0)
 
+	l := sync.Mutex{}
+	g, _ := errgroup.WithContext(context.Background())
+	g.SetLimit(getFromEnvOrDefault(SPLIT_PARALLEL_THREAD, 50))
 	for i := 0; i < len(texts); i++ {
-		chunks, err := textSplitter.SplitText(texts[i])
-		if err != nil {
-			return nil, err
-		}
-
-		for _, chunk := range chunks {
-			// Copy the document metadata
-			curMetadata := make(map[string]any, len(metadatas[i]))
-			for key, value := range metadatas[i] {
-				curMetadata[key] = value
+		g.Go(func() error {
+			chunks, err := textSplitter.SplitText(texts[i])
+			if err != nil {
+				return err
 			}
 
-			documents = append(documents, schema.Document{
-				PageContent: chunk,
-				Metadata:    curMetadata,
-			})
-		}
+			for _, chunk := range chunks {
+				// Copy the document metadata
+				curMetadata := make(map[string]any, len(metadatas[i]))
+				for key, value := range metadatas[i] {
+					curMetadata[key] = value
+				}
+
+				l.Lock()
+				documents = append(documents, schema.Document{
+					PageContent: chunk,
+					Metadata:    curMetadata,
+				})
+				l.Unlock()
+			}
+			return nil
+		})
+
 	}
 
-	return documents, nil
+	return documents, g.Wait()
+}
+
+func getFromEnvOrDefault(env string, def int) int {
+	v, _ := strconv.Atoi(os.Getenv(env))
+	if v != 0 {
+		return v
+	}
+
+	return def
 }
 
 // joinDocs comines two documents with the separator used to split them.
